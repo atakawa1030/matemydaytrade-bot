@@ -2,10 +2,17 @@ require('dotenv').config();
 const axios = require('axios');
 const cron = require('node-cron');
 const { RSI, Stochastic } = require('technicalindicators');
+const express = require('express');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const API_KEY = process.env.TWELVE_API_KEY;
+
+const app = express();
+app.get('/', (req, res) => res.send('Matemydaytrade Bot is running 24/7!'));
+app.listen(process.env.PORT || 3000, () => {
+    console.log('✅ Dummy Web Server is running');
+});
 
 // 1. ฟังก์ชันดึงข้อมูลแบบระบุ Timeframe (interval)
 async function fetchGoldData(interval) {
