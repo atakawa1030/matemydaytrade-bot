@@ -1,23 +1,26 @@
 require('dotenv').config();
 const axios = require('axios');
 const cron = require('node-cron');
-const { RSI, Stochastic } = require('technicalindicators');
 const express = require('express');
+const { RSI, ATR, BollingerBands } = require('technicalindicators');
+
+// --- สร้างประตูหลอกให้ Railway สบายใจ (รัน 24/7) ---
+const app = express();
+app.get('/', (req, res) => res.send('ABLE Matemydaytrade Bot is running 24/7!'));
+app.listen(process.env.PORT || 3000, () => {
+    console.log('✅ Dummy Web Server is running');
+});
+// ------------------------------------------------
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const API_KEY = process.env.TWELVE_API_KEY;
 
-const app = express();
-app.get('/', (req, res) => res.send('Matemydaytrade Bot is running 24/7!'));
-app.listen(process.env.PORT || 3000, () => {
-    console.log('✅ Dummy Web Server is running');
-});
-
-// 1. ฟังก์ชันดึงข้อมูลแบบระบุ Timeframe (interval)
+// 1. ฟังก์ชันดึงข้อมูลจาก Twelve Data (เพิ่ม Open และ Volume)
 async function fetchGoldData(interval) {
     try {
-        const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=50&apikey=${API_KEY}`;
+        // ขอข้อมูล 100 แท่ง เพื่อให้คำนวณค่าเฉลี่ย ATR 50 แท่งได้แม่นยำ
+        const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=100&apikey=${API_KEY}`;
         const response = await axios.get(url);
         
         if (response.data.status !== "ok") {
@@ -27,9 +30,11 @@ async function fetchGoldData(interval) {
 
         const values = response.data.values.reverse();
         return {
-            close: values.map(v => parseFloat(v.close)),
+            open: values.map(v => parseFloat(v.open)),
             high: values.map(v => parseFloat(v.high)),
             low: values.map(v => parseFloat(v.low)),
+            close: values.map(v => parseFloat(v.close)),
+            volume: values.map(v => parseFloat(v.volume || 1)), // ป้องกันกรณีโบรกเกอร์ไม่ส่ง Volume มา
             currentPrice: parseFloat(values[values.length - 1].close)
         };
     } catch (error) {
@@ -38,76 +43,135 @@ async function fetchGoldData(interval) {
     }
 }
 
-// 2. ฟังก์ชันตรวจสอบสัญญาณ โดยรับค่า Timeframe เข้ามา
+// 2. ฟังก์ชันสมองกล ABLE Scoring System
+function calculateABLEScore(data) {
+    const { open, high, low, close, volume } = data;
+    const currentIdx = close.length - 1;
+    const prevIdx = close.length - 2;
+
+    // --- คำนวณ Indicators ---
+    const rsiList = RSI.calculate({ values: close, period: 14 });
+    const currentRsi = rsiList[rsiList.length - 1];
+
+    const atrList = ATR.calculate({ high, low, close, period: 14 });
+    const currentAtr = atrList[atrList.length - 1];
+    
+    // หาค่าเฉลี่ย ATR 50 แท่ง
+    const atr50 = atrList.slice(-50);
+    const avgAtr = atr50.reduce((a, b) => a + b, 0) / atr50.length;
+
+    const bbList = BollingerBands.calculate({ period: 20, values: close, stdDev: 2 });
+    const currentBB = bbList[bbList.length - 1];
+
+    // --- เริ่มให้คะแนน ---
+    let score = 0;
+    let details = []; // เก็บเหตุผลที่ได้คะแนน
+    let sweepBuy = false;
+    let sweepSell = false;
+    let isCompression = false;
+    let orderFlowBias = "NONE";
+
+    // กฎที่ 1: Liquidity Sweep (+20 แต้ม)
+    if (high[currentIdx] > high[prevIdx] && close[currentIdx] < high[prevIdx]) {
+        sweepSell = true;
+        score += 20;
+        details.push("🧹 Liquidity Sweep (Top)");
+    }
+    if (low[currentIdx] < low[prevIdx] && close[currentIdx] > low[prevIdx]) {
+        sweepBuy = true;
+        score += 20;
+        details.push("🧹 Liquidity Sweep (Bottom)");
+    }
+
+    // กฎที่ 2: Volatility Compression (+15 แต้ม)
+    if (currentAtr < (avgAtr * 0.6)) {
+        isCompression = true;
+        score += 15;
+        details.push("🗜️ Volatility Compression");
+    }
+
+    // กฎที่ 3: Order Flow Imbalance (+15 แต้ม) - ดูแรงซื้อขาย 5 แท่งล่าสุด
+    let buyVol = 0; let sellVol = 0;
+    for (let i = currentIdx - 4; i <= currentIdx; i++) {
+        if (close[i] > open[i]) buyVol += volume[i];
+        else sellVol += volume[i];
+    }
+    
+    if (buyVol > sellVol * 1.5) {
+        orderFlowBias = "BUY";
+        score += 15;
+        details.push("🌊 Order Flow (BUY)");
+    } else if (sellVol > buyVol * 1.5) {
+        orderFlowBias = "SELL";
+        score += 15;
+        details.push("🌊 Order Flow (SELL)");
+    }
+
+    // กฎที่ 4: RSI Extreme (+10 แต้ม)
+    if (currentRsi < 30) {
+        score += 10;
+        details.push("📉 RSI Oversold");
+    } else if (currentRsi > 70) {
+        score += 10;
+        details.push("📈 RSI Overbought");
+    }
+
+    // --- สรุปผลการยิง Signal ---
+    let action = "NONE";
+    // ปรับเกณฑ์คะแนนลงมาที่ 45 (เพราะเราขาดโมดูล Session & ABC Pattern แบบออริจินัล)
+    if (score >= 45) {
+        if (currentRsi <= 35 && sweepBuy && orderFlowBias !== "SELL") {
+            action = "BUY";
+        } else if (currentRsi >= 65 && sweepSell && orderFlowBias !== "BUY") {
+            action = "SELL";
+        }
+    }
+
+    return { action, score, currentRsi, details };
+}
+
+// 3. ฟังก์ชันหลักสำหรับตรวจสอบแต่ละ Timeframe
 async function checkSignal(interval) {
-    console.log(`⏳ [${new Date().toLocaleTimeString()}] Checking XAUUSD [${interval}]...`);
+    console.log(`⏳ [${new Date().toLocaleTimeString()}] Checking ABLE Logic [${interval}]...`);
     
     const data = await fetchGoldData(interval);
     if (!data) return;
 
-    // คำนวณ RSI (14)
-    const rsiResult = RSI.calculate({ values: data.close, period: 14 });
-    const currentRsi = rsiResult[rsiResult.length - 1];
+    const analysis = calculateABLEScore(data);
 
-    // คำนวณ Stochastic (14, 3, 3)
-    const stochResult = Stochastic.calculate({
-        high: data.high, low: data.low, close: data.close,
-        period: 14, signalPeriod: 3
-    });
-    
-    const currentStoch = stochResult[stochResult.length - 1];
-    const prevStoch = stochResult[stochResult.length - 2];
-
-    let action = "NONE";
-
-    // --- เงื่อนไขการเข้าเทรด Stoch Cross ---
-    // BUY: %K ตัด %D ขึ้น ในโซน < 20
-    if (prevStoch.k < prevStoch.d && currentStoch.k > currentStoch.d && currentStoch.k < 20) {
-        action = "BUY";
-    }
-    // SELL: %K ตัด %D ลง ในโซน > 80
-    else if (prevStoch.k > prevStoch.d && currentStoch.k < currentStoch.d && currentStoch.k > 80) {
-        action = "SELL";
-    }
-
-    if (action !== "NONE") {
-        sendTelegramSignal(action, data.currentPrice, currentRsi, currentStoch, interval);
+    if (analysis.action !== "NONE") {
+        sendTelegramSignal(analysis.action, data.currentPrice, analysis.currentRsi, analysis.score, analysis.details, interval);
     } else {
-        console.log(`😴 [${interval}] ไม่มีสัญญาณเข้าเทรด`);
+        console.log(`😴 [${interval}] Score: ${analysis.score}/100 - รอจังหวะเทรด...`);
     }
 }
 
-// 3. ฟังก์ชันจัดรูปแบบและส่ง Telegram (เพิ่ม TP1, TP2, TP3, SL)
-async function sendTelegramSignal(action, price, rsi, stoch, interval) {
+// 4. ฟังก์ชันส่ง Telegram (เพิ่ม Score และเหตุผล)
+async function sendTelegramSignal(action, price, rsi, score, details, interval) {
     const emoji = action === "BUY" ? "🟢" : "🔴";
     
-    // กำหนดระยะ TP และ SL (อิงตามทองคำ ระยะเหรียญ)
-    // คุณสามารถแก้ตัวเลข 3, 6, 10, 5 ให้เป็นระยะจุดที่คุณต้องการได้ครับ
-    let tp1, tp2, tp3, sl;
-    if (action === "BUY") {
-        tp1 = price + 3;  // บวก 300 จุด
-        tp2 = price + 6;  // บวก 600 จุด
-        tp3 = price + 10; // บวก 1000 จุด
-        sl = price - 5;   // ลบ 500 จุด
-    } else {
-        tp1 = price - 3;
-        tp2 = price - 6;
-        tp3 = price - 10;
-        sl = price + 5;
-    }
+    const tp1 = action === "BUY" ? price + 3 : price - 3;
+    const tp2 = action === "BUY" ? price + 6 : price - 6;
+    const tp3 = action === "BUY" ? price + 10 : price - 10;
+    const sl = action === "BUY" ? price - 5 : price + 5;
+
+    // แปลง Array เหตุผลให้เป็นข้อความมี Bullet
+    const reasonsText = details.length > 0 ? details.map(d => `• ${d}`).join('\n') : "• โครงสร้างราคาเข้าเงื่อนไข";
 
     const message = `
-<b>|| Matemydaytrade GOLD Fx ||</b>
+<b>|| ABLE GOLD ENGINE ||</b>
 ${emoji} <b>XAUUSD ${action}</b>   ${price.toFixed(2)}
 ⏱ <b>Timeframe:</b> ${interval}
+🧠 <b>AI Score:</b> ${score} แต้ม
 
 <b>TP¹</b>  ${tp1.toFixed(2)}
 <b>TP²</b>  ${tp2.toFixed(2)}
 <b>TP³</b>  ${tp3.toFixed(2)}
 <b>SL</b>   ${sl.toFixed(2)}
 
-📊 <b>RSI (14):</b> ${rsi.toFixed(2)}
-📉 <b>Stoch:</b> %K=${stoch.k.toFixed(1)} / %D=${stoch.d.toFixed(1)}
+<b>เหตุผลสนับสนุน:</b>
+${reasonsText}
+
 ✨ ขอให้พอร์ตฟ้า กำไรปังๆ ครับ!
     `;
 
@@ -118,33 +182,18 @@ ${emoji} <b>XAUUSD ${action}</b>   ${price.toFixed(2)}
             text: message,
             parse_mode: 'HTML'
         });
-        console.log(`✅ Telegram Alert Sent: ${action} [${interval}]`);
+        console.log(`✅ ABLE Alert Sent: ${action} [${interval}] (Score: ${score})`);
     } catch (err) {
         console.error("❌ Telegram Error:", err.message);
     }
 }
 
 // ==========================================
-// 🚀 เริ่มต้นการทำงาน (ตั้งเวลา จันทร์ - ศุกร์)
+// 🚀 เริ่มต้นการทำงาน (จันทร์ - ศุกร์)
 // ==========================================
-console.log("🚀 Matemydaytrade Auto-Signal Bot Started!");
+console.log("🚀 ABLE Matemydaytrade Bot Started!");
 
-// 1. เช็กกราฟ 5 นาที (ทุกๆ 5 นาที เฉพาะจันทร์-ศุกร์)
-cron.schedule('*/5 * * * 1-5', () => {
-    checkSignal('5min');
-});
-
-// 2. เช็กกราฟ 15 นาที (ทุกๆ 15 นาที เฉพาะจันทร์-ศุกร์)
-cron.schedule('*/15 * * * 1-5', () => {
-    checkSignal('15min');
-});
-
-// 3. เช็กกราฟ 1 ชั่วโมง (ต้นชั่วโมง เฉพาะจันทร์-ศุกร์)
-cron.schedule('0 * * * 1-5', () => {
-    checkSignal('1h');
-});
-
-// 4. เช็กกราฟ 4 ชั่วโมง (ทุกๆ 4 ชั่วโมง เฉพาะจันทร์-ศุกร์)
-cron.schedule('0 */4 * * 1-5', () => {
-    checkSignal('4h');
-});
+cron.schedule('*/5 * * * 1-5', () => checkSignal('5min'));
+cron.schedule('*/15 * * * 1-5', () => checkSignal('15min'));
+cron.schedule('0 * * * 1-5', () => checkSignal('1h'));
+cron.schedule('0 */4 * * 1-5', () => checkSignal('4h'));
